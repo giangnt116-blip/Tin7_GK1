@@ -1,0 +1,8 @@
+{
+  "name": "FPT Tin Grader 7",
+  "description": "Ứng dụng chấm và quản lý điểm Tin học 7 - Trường TH, THCS và THPT FPT Đà Nẵng",
+  "prompt": "FPT Tin Grader 7",
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

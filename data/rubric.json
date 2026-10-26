@@ -1,0 +1,16 @@
+{
+  "version":"2026-10-26-v1",
+  "note":"Phiếu gốc và một số quyết định GV xác nhận. Chưa nhập đầy đủ 195 mã tình huống lịch sử: tuyệt đối không suy đoán hoặc gắn nhãn 'đã xác nhận' cho các mã chưa có dữ liệu.",
+  "criteria":[
+    {"id":"TC1","label":"Chuẩn bị cấu trúc thư mục","max":1},
+    {"id":"TC2","label":"Tìm và lưu hình ảnh Đà Nẵng","max":2},
+    {"id":"TC3","label":"Tạo tệp đáp án","max":1},
+    {"id":"TC4","label":"Trả lời câu hỏi kiến thức","max":3},
+    {"id":"TC5","label":"Hoàn thiện sản phẩm","max":3}
+  ],
+  "tc4Parts":{"C1-A":{"label":"Xác định phát biểu SAI","max":1},"C1-B":{"label":"Micro là thiết bị vào","max":0.25},"C1-C":{"label":"Loa là thiết bị ra","max":0.25},"C2-A":{"label":"MP3 là tệp âm thanh","max":1},"C2-B":{"label":"Kênh giao tiếp trực tuyến phù hợp","max":0.5}},
+  "tc4Exceptions":{"TC4-32":0.5,"TC4-33":0.5,"TC4-34":1,"TC4-35":1,"TC4-39":1},
+  "caseRules":[],
+  "teacherApprovedHistoricalCodeCount":80,
+  "historicalCaseDescriptionsImported":false
+}
