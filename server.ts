@@ -103,14 +103,24 @@ app.post('/api/unrar', async (req: Request, res: Response) => {
       });
     }
 
+    const arrayBuffer = buffer.buffer.slice(
+      buffer.byteOffset,
+      buffer.byteOffset + buffer.byteLength
+    );
+
     const unrar = await import('node-unrar-js');
-    const extractor = await unrar.createExtractorFromData({ data: buffer });
+    const extractor = await unrar.createExtractorFromData({ data: arrayBuffer });
 
     // Kiểm tra danh mục tệp và cờ mật khẩu
     const list = extractor.getFileList();
-    const headers = [...list.fileHeaders];
+    const arcHeader = list.arcHeader;
+    const fileHeaders = [...list.fileHeaders];
 
-    if (headers.some((h) => h.flags?.passwordProtected)) {
+    const isEncrypted =
+      Boolean(arcHeader?.flags?.headerEncrypted) ||
+      fileHeaders.some((h) => Boolean(h.flags?.encrypted));
+
+    if (isEncrypted) {
       return res.status(422).json({
         error:
           'Tệp RAR có cài đặt mật khẩu bảo vệ. Theo quy định, không chấm 0 điểm mà yêu cầu giáo viên kiểm tra trực tiếp với học sinh.',
@@ -125,8 +135,13 @@ app.post('/api/unrar', async (req: Request, res: Response) => {
     const resultFiles = [];
 
     for (const f of files) {
-      if (f.header.flags.directory) continue;
+      const header = f.fileHeader;
+      if (!header) continue;
+      if (header.flags && header.flags.directory) continue;
+
       const dataBuf = f.extraction;
+      if (!dataBuf || dataBuf.byteLength === 0) continue;
+
       totalExtractedSize += dataBuf.byteLength;
 
       // Giới hạn tổng giải nén 120MB chống decompression bomb
@@ -138,8 +153,9 @@ app.post('/api/unrar', async (req: Request, res: Response) => {
       }
 
       // Kiểm tra an toàn đường dẫn (chống path traversal)
-      const safePath = f.header.name.replaceAll('\\', '/');
+      const safePath = (header.name || '').replaceAll('\\', '/');
       if (
+        !safePath ||
         safePath.startsWith('/') ||
         safePath.split('/').includes('..') ||
         /^[a-z]:/i.test(safePath)
@@ -163,8 +179,24 @@ app.post('/api/unrar', async (req: Request, res: Response) => {
     });
   } catch (err: any) {
     console.error('Lỗi giải nén RAR:', err);
+    const msg = err.message || String(err);
+    const isPwd =
+      msg.includes('PASSWORD') ||
+      err.reason === 'ERAR_MISSING_PASSWORD' ||
+      err.reason === 'ERAR_BAD_PASSWORD';
+    const isCorrupt =
+      msg.includes('BAD_ARCHIVE') ||
+      msg.includes('BAD_DATA') ||
+      err.reason === 'ERAR_BAD_ARCHIVE';
+
     return res.status(422).json({
-      error: `Không thể giải nén tệp RAR (${err.message || 'Lỗi cấu trúc nén hoặc tệp hỏng'}). Yêu cầu giáo viên kiểm tra lại tệp nguồn.`,
+      error: isPwd
+        ? 'Tệp RAR có cài đặt mật khẩu bảo vệ. Theo quy định, không chấm 0 điểm mà yêu cầu giáo viên kiểm tra trực tiếp với học sinh.'
+        : isCorrupt
+        ? 'Tệp RAR bị hỏng hoặc lỗi định dạng nén (ERAR_BAD_ARCHIVE). Yêu cầu giáo viên kiểm tra lại tệp nguồn.'
+        : `Không thể giải nén tệp RAR (${msg}). Yêu cầu giáo viên kiểm tra lại tệp nguồn.`,
+      isPasswordProtected: isPwd,
+      isCorrupted: isCorrupt,
     });
   }
 });
@@ -406,6 +438,25 @@ app.get('/api/demo-samples', (req: Request, res: Response) => {
 // Legacy mock sample route for compatibility
 app.get('/api/mock-samples', (req: Request, res: Response) => {
   res.redirect('/api/demo-samples');
+});
+
+// Endpoint serving real RAR files for live testing (RAR4, RAR5, 7A5 students)
+app.get('/api/sample-rar-files', (req: Request, res: Response) => {
+  const dir = path.resolve('public/sample_rars');
+  if (!fs.existsSync(dir)) {
+    return res.json({ samples: [] });
+  }
+  const fileNames = fs.readdirSync(dir);
+  const samples = fileNames.map((f) => {
+    const fullPath = path.join(dir, f);
+    const buf = fs.readFileSync(fullPath);
+    return {
+      name: f,
+      size: buf.length,
+      base64: buf.toString('base64'),
+    };
+  });
+  res.json({ samples });
 });
 
 // AI Grading Endpoint

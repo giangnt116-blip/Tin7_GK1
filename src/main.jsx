@@ -90,9 +90,11 @@ function download(data, name, mime = 'application/octet-stream') {
 
 function uint8ToBase64(u8) {
   let binary = '';
-  const len = Math.min(u8.byteLength, 1024 * 512);
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(u8[i]);
+  const chunkSize = 0x8000; // 32KB chunking avoids call stack limit while processing full file
+  const len = u8.length || u8.byteLength;
+  for (let i = 0; i < len; i += chunkSize) {
+    const chunk = u8.subarray(i, Math.min(i + chunkSize, len));
+    binary += String.fromCharCode.apply(null, chunk);
   }
   return window.btoa(binary);
 }
@@ -409,8 +411,10 @@ function App() {
                 console.warn('Lỗi giải nén ZIP con:', zipErr);
               }
             } else if (/\.rar$/i.test(f.name) || arcType === 'rar') {
+              let fData = null;
               try {
-                const subEntries = await extractRarViaServer(new Uint8Array(await f.arrayBuffer()), f.webkitRelativePath.replace(/\.[^.]+$/, '') + '/');
+                fData = new Uint8Array(await f.arrayBuffer());
+                const subEntries = await extractRarViaServer(fData, f.webkitRelativePath.replace(/\.[^.]+$/, '') + '/');
                 allExtractedEntries.push(...subEntries);
               } catch (rarErr) {
                 console.warn('Lỗi giải nén RAR con:', rarErr);
@@ -418,6 +422,8 @@ function App() {
                   label: f.name,
                   sourceType: 'RAR',
                   error: rarErr.message,
+                  rawBytes: fData,
+                  rawFile: f,
                 });
               }
             } else {
@@ -441,8 +447,9 @@ function App() {
             });
           }
         } else if (item.type === 'RAR') {
+          let u8 = null;
           try {
-            const u8 = new Uint8Array(await item.fileObject.arrayBuffer());
+            u8 = new Uint8Array(await item.fileObject.arrayBuffer());
             const entries = await extractRarViaServer(u8, item.name.replace(/\.[^.]+$/, '') + '/');
             allExtractedEntries.push(...entries);
           } catch (rarErr) {
@@ -450,6 +457,8 @@ function App() {
               label: item.name,
               sourceType: 'RAR',
               error: rarErr.message,
+              rawBytes: u8,
+              rawFile: item.fileObject,
             });
           }
         }
@@ -526,6 +535,8 @@ function App() {
           similarity: 0,
           matchStatus: 'Lỗi đọc tệp',
           matchReason: errRec.error,
+          rawBytes: errRec.rawBytes || null,
+          rawFile: errRec.rawFile || null,
           files: [],
           info: { evidence: ['Tệp bị lỗi hoặc có mật khẩu'], images: [] },
           scores: [0, 0, 0, 0, 0],
@@ -686,6 +697,275 @@ function App() {
     // Remove source batch
     setBatches((prev) => prev.filter((b) => b.id !== sourceBatch.id));
     setStatusMessage(`Đã gộp thành công bài nộp vào học sinh ${target.name}.`);
+  }
+
+  // Retry extraction for a single failed RAR/ZIP batch
+  async function retryExtractBatch(batchId) {
+    const b = batches.find((x) => x.id === batchId);
+    if (!b) return;
+
+    setError('');
+    setLoading(`Đang thử giải nén lại: ${b.label}...`);
+
+    try {
+      let u8 = b.rawBytes;
+      if (!u8 && b.rawFile) {
+        u8 = new Uint8Array(await b.rawFile.arrayBuffer());
+      }
+
+      // If bytes not found in memory, check if we can fetch from sample-rar-files
+      if (!u8) {
+        try {
+          const res = await fetch('/api/sample-rar-files');
+          const data = await res.json();
+          const matchSample = (data.samples || []).find((s) => s.name === b.label);
+          if (matchSample) {
+            const raw = atob(matchSample.base64);
+            u8 = new Uint8Array(raw.length);
+            for (let i = 0; i < raw.length; i++) u8[i] = raw.charCodeAt(i);
+          }
+        } catch (_) {}
+      }
+
+      if (!u8) {
+        throw new Error(
+          'Không tìm thấy dữ liệu tệp trong bộ nhớ. Vui lòng bấm "Chọn tệp" để tải lại tệp RAR này.'
+        );
+      }
+
+      const prefix = b.label.replace(/\.[^.]+$/, '') + '/';
+      const entries = await extractRarViaServer(u8, prefix);
+
+      if (!entries || entries.length === 0) {
+        throw new Error('Tệp RAR rỗng hoặc không trích xuất được tệp nào.');
+      }
+
+      // Re-segment
+      const segments = inferSegments(entries, b.label.replace(/\.[^.]+$/, ''));
+      const seg = segments[0] || { label: b.label, files: entries };
+      const info = classify(seg.files);
+
+      // Re-run matching with current class roster
+      const matchResult = matchStudentAdvanced(seg.label, seg.files, ENRICHED_ROSTER, cl);
+
+      update(b.id, {
+        files: seg.files,
+        info,
+        rawBytes: u8,
+        matchStatus: matchResult.status,
+        matchReason: `Giải nén lại thành công (${seg.files.length} tệp). ${matchResult.reason}`,
+        name: matchResult.studentName || '',
+        studentId: matchResult.studentId || null,
+        targetClass: matchResult.targetClass || cl,
+        similarity: matchResult.similarity || 0,
+        suggestedStudent: matchResult.suggestedStudent || null,
+        wrongClassStudent: matchResult.wrongClassStudent || null,
+        candidates: matchResult.candidates || [],
+        status: 'Chưa chấm',
+        notes: '',
+        aiError: '',
+      });
+
+      setStatusMessage(`Đã giải nén và ghép tên thành công bài ${b.label} (${seg.files.length} tệp)!`);
+    } catch (err) {
+      console.error('Lỗi khi thử giải nén lại:', err);
+      update(b.id, {
+        matchStatus: 'Lỗi đọc tệp',
+        matchReason: `Cần kiểm tra: ${err.message}`,
+        notes: `Cần kiểm tra: ${err.message}`,
+        status: 'Lỗi',
+      });
+      setError(`Không thể giải nén bài ${b.label}: ${err.message}`);
+    } finally {
+      setLoading('');
+    }
+  }
+
+  // Retry all failed batches
+  async function retryAllFailedBatches() {
+    const failedBatches = batches.filter(
+      (b) => b.matchStatus === 'Lỗi đọc tệp' || (b.sourceType === 'RAR' && b.files.length === 0)
+    );
+
+    if (failedBatches.length === 0) {
+      setStatusMessage('Không có bài nào bị lỗi cần giải nén lại.');
+      return;
+    }
+
+    setLoading(`Đang thử lại ${failedBatches.length} bài lỗi...`);
+    let successCount = 0;
+    let failCount = 0;
+
+    for (const b of failedBatches) {
+      try {
+        let u8 = b.rawBytes;
+        if (!u8 && b.rawFile) {
+          u8 = new Uint8Array(await b.rawFile.arrayBuffer());
+        }
+
+        if (!u8) {
+          const res = await fetch('/api/sample-rar-files');
+          const data = await res.json();
+          const matchSample = (data.samples || []).find((s) => s.name === b.label);
+          if (matchSample) {
+            const raw = atob(matchSample.base64);
+            u8 = new Uint8Array(raw.length);
+            for (let i = 0; i < raw.length; i++) u8[i] = raw.charCodeAt(i);
+          }
+        }
+
+        if (!u8) {
+          failCount++;
+          continue;
+        }
+
+        const prefix = b.label.replace(/\.[^.]+$/, '') + '/';
+        const entries = await extractRarViaServer(u8, prefix);
+
+        if (entries && entries.length > 0) {
+          const segments = inferSegments(entries, b.label.replace(/\.[^.]+$/, ''));
+          const seg = segments[0] || { label: b.label, files: entries };
+          const info = classify(seg.files);
+          const matchResult = matchStudentAdvanced(seg.label, seg.files, ENRICHED_ROSTER, cl);
+
+          update(b.id, {
+            files: seg.files,
+            info,
+            rawBytes: u8,
+            matchStatus: matchResult.status,
+            matchReason: `Giải nén lại thành công (${seg.files.length} tệp). ${matchResult.reason}`,
+            name: matchResult.studentName || '',
+            studentId: matchResult.studentId || null,
+            targetClass: matchResult.targetClass || cl,
+            similarity: matchResult.similarity || 0,
+            suggestedStudent: matchResult.suggestedStudent || null,
+            wrongClassStudent: matchResult.wrongClassStudent || null,
+            candidates: matchResult.candidates || [],
+            status: 'Chưa chấm',
+            notes: '',
+            aiError: '',
+          });
+          successCount++;
+        } else {
+          failCount++;
+        }
+      } catch (e) {
+        failCount++;
+      }
+    }
+
+    setLoading('');
+    setStatusMessage(
+      `Hoàn tất thử lại: ${successCount} bài giải nén thành công, ${failCount} bài cần kiểm tra trực tiếp.`
+    );
+  }
+
+  // Load real RAR test files (Nguyễn Công Nhật Minh, Hồ Nhật Duy, Ngô Bảo Tín & RAR4/RAR5)
+  async function loadRealRarTestFiles() {
+    setError('');
+    setLoading('Đang nạp và giải nén các tệp RAR thực tế (RAR4, RAR5, lớp 7A5)...');
+    try {
+      const res = await fetch('/api/sample-rar-files');
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Lỗi tải tệp RAR mẫu');
+
+      // Set class to 7A5 because Minh, Duy, Tin belong to 7A5
+      setCl('7A5');
+
+      const newRecords = [];
+
+      for (const s of data.samples) {
+        const raw = atob(s.base64);
+        const u8 = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) u8[i] = raw.charCodeAt(i);
+
+        let entries = [];
+        let extractErr = null;
+
+        try {
+          entries = await extractRarViaServer(u8, s.name.replace(/\.[^.]+$/, '') + '/');
+        } catch (e) {
+          extractErr = e.message;
+        }
+
+        if (extractErr) {
+          newRecords.push({
+            id: crypto.randomUUID(),
+            label: s.name,
+            sourceType: 'RAR',
+            name: '',
+            studentId: null,
+            targetClass: '7A5',
+            similarity: 0,
+            matchStatus: 'Lỗi đọc tệp',
+            matchReason: extractErr,
+            rawBytes: u8,
+            files: [],
+            info: { evidence: [extractErr], images: [] },
+            scores: [0, 0, 0, 0, 0],
+            approved: false,
+            approvedAt: null,
+            approvedScores: null,
+            auditHistory: [],
+            reviewed: [false, false, false, false, false],
+            notes: `Cần kiểm tra: ${extractErr}`,
+            status: 'Lỗi',
+            aiResult: null,
+            aiError: extractErr,
+            tc4parts: [0, 0, 0, 0, 0],
+            tc4exception: '',
+          });
+        } else {
+          const segments = inferSegments(entries, s.name.replace(/\.[^.]+$/, ''));
+          const seg = segments[0] || { label: s.name, files: entries };
+          const info = classify(seg.files);
+          const matchResult = matchStudentAdvanced(seg.label, seg.files, ENRICHED_ROSTER, '7A5');
+
+          newRecords.push({
+            id: crypto.randomUUID(),
+            label: s.name,
+            sourceType: 'RAR',
+            name: matchResult.studentName || '',
+            studentId: matchResult.studentId || null,
+            targetClass: '7A5',
+            similarity: matchResult.similarity || 0,
+            matchStatus: matchResult.status,
+            matchReason: matchResult.reason,
+            suggestedStudent: matchResult.suggestedStudent || null,
+            wrongClassStudent: matchResult.wrongClassStudent || null,
+            candidates: matchResult.candidates || [],
+            rawBytes: u8,
+            files: seg.files,
+            info,
+            scores: [0, 0, 0, 0, 0],
+            approved: false,
+            approvedAt: null,
+            approvedScores: null,
+            auditHistory: [],
+            reviewed: [false, false, false, false, false],
+            notes: '',
+            status: 'Chưa chấm',
+            aiResult: null,
+            aiError: '',
+            tc4parts: [0, 0, 0, 0, 0],
+            tc4exception: '',
+          });
+        }
+      }
+
+      setBatches(newRecords);
+      if (newRecords.length > 0) setSelected(newRecords[0].id);
+      setTab('matching');
+      const okCount = newRecords.filter((b) => b.matchStatus !== 'Lỗi đọc tệp').length;
+      const errCount = newRecords.length - okCount;
+      setStatusMessage(
+        `Đã nạp và giải nén các bài RAR: ${okCount} bài thành công (Minh, Duy, Tín, RAR4, RAR5), ${errCount} bài phát hiện lỗi/mật khẩu an toàn.`
+      );
+    } catch (e) {
+      setError('Lỗi kiểm thử tệp RAR: ' + e.message);
+    } finally {
+      setLoading('');
+    }
   }
 
   // Single Student AI Grading
@@ -1598,6 +1878,49 @@ function App() {
                 </button>
               </div>
 
+              {/* Real RAR test files button (Nguyễn Công Nhật Minh, Hồ Nhật Duy, Ngô Bảo Tín & RAR4/RAR5) */}
+              <div
+                style={{
+                  marginTop: 12,
+                  padding: 16,
+                  background: '#f8fafc',
+                  borderRadius: 10,
+                  border: '1px solid #cbd5e1',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  flexWrap: 'wrap',
+                  gap: 12,
+                }}
+              >
+                <div>
+                  <strong style={{ color: '#0f172a', display: 'block', fontSize: 13 }}>
+                    Kiểm thử giải nén tệp RAR thực tế (Nguyễn Công Nhật Minh, Hồ Nhật Duy, Ngô Bảo Tín & RAR4/RAR5)
+                  </strong>
+                  <span style={{ fontSize: 12, color: '#475569' }}>
+                    Tự động nạp các tệp RAR thực tế lớp 7A5, kiểm tra giải nén WebAssembly qua /api/unrar và nhận diện tên học sinh.
+                  </span>
+                </div>
+                <button
+                  onClick={loadRealRarTestFiles}
+                  className="smallbutton"
+                  style={{
+                    padding: '9px 16px',
+                    borderRadius: 8,
+                    fontWeight: 700,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    cursor: 'pointer',
+                    background: '#2563eb',
+                    color: '#ffffff',
+                    border: 'none',
+                  }}
+                >
+                  <FileArchive size={16} /> Nạp & kiểm thử RAR thực tế
+                </button>
+              </div>
+
               {loading && <p className="loading">{loading}</p>}
             </section>
           </>
@@ -1615,7 +1938,25 @@ function App() {
                   khi chấm.
                 </p>
               </div>
-              <div style={{ display: 'flex', gap: 8 }}>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                {batches.some((b) => b.matchStatus === 'Lỗi đọc tệp' || (b.sourceType === 'RAR' && b.files.length === 0)) && (
+                  <button
+                    onClick={retryAllFailedBatches}
+                    className="smallbutton"
+                    style={{
+                      background: '#fef3c7',
+                      color: '#92400e',
+                      border: '1px solid #fde68a',
+                      fontWeight: 700,
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 6,
+                    }}
+                    title="Thử giải nén lại tất cả bài bị lỗi"
+                  >
+                    <RotateCcw size={14} /> Thử lại tất cả bài lỗi
+                  </button>
+                )}
                 <button
                   onClick={() => setTab('upload')}
                   className="smallbutton"
@@ -1661,6 +2002,48 @@ function App() {
                 <strong style={{ color: '#2563eb' }}>{matchingStats.readyToGrade}</strong>
               </div>
             </div>
+
+            {/* Warning banner for failed batches */}
+            {batches.some((b) => b.matchStatus === 'Lỗi đọc tệp') && (
+              <div
+                style={{
+                  margin: '12px 0',
+                  padding: '10px 14px',
+                  background: '#fff1f2',
+                  border: '1px solid #fecdd3',
+                  borderRadius: 8,
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  fontSize: 12,
+                  color: '#9f1239',
+                  flexWrap: 'wrap',
+                  gap: 8,
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <AlertTriangle size={16} />
+                  <span>
+                    Có <strong>{batches.filter((b) => b.matchStatus === 'Lỗi đọc tệp').length}</strong> bài nộp chưa giải nén được (tệp bị lỗi hoặc có mật khẩu). Theo quy định, hệ thống <strong>không chấm 0 điểm</strong>.
+                  </span>
+                </div>
+                <button
+                  onClick={retryAllFailedBatches}
+                  className="smallbutton"
+                  style={{
+                    background: '#ffffff',
+                    color: '#9f1239',
+                    border: '1px solid #fecdd3',
+                    fontWeight: 700,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 5,
+                  }}
+                >
+                  <RotateCcw size={13} /> Thử lại tất cả bài lỗi
+                </button>
+              </div>
+            )}
 
             {/* Matching Table (8 Columns - Mục 5) */}
             <div className="matching-table-wrap">
@@ -1794,6 +2177,26 @@ function App() {
                             >
                               <Eye size={14} />
                             </button>
+
+                            {/* Retry extraction button for failed items */}
+                            {(isErr || (b.sourceType === 'RAR' && b.files.length === 0)) && (
+                              <button
+                                className="smallbutton"
+                                style={{
+                                  background: '#fef3c7',
+                                  color: '#92400e',
+                                  border: '1px solid #fde68a',
+                                  fontWeight: 700,
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: 4,
+                                }}
+                                onClick={() => retryExtractBatch(b.id)}
+                                title="Thử giải nén lại tệp RAR này"
+                              >
+                                <RotateCcw size={13} /> Thử lại
+                              </button>
+                            )}
 
                             {/* Merge Duplicate option */}
                             {isDup && (
@@ -1977,6 +2380,43 @@ function App() {
                       )}
                     </div>
                   </div>
+
+                  {/* Warning banner if current batch failed extraction */}
+                  {(current.matchStatus === 'Lỗi đọc tệp' || (current.sourceType === 'RAR' && current.files.length === 0)) && (
+                    <div
+                      style={{
+                        background: '#fff1f2',
+                        border: '1px solid #fecdd3',
+                        borderRadius: 8,
+                        padding: '12px 16px',
+                        marginBottom: 16,
+                        color: '#9f1239',
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                        <AlertTriangle size={18} />
+                        <strong>Tệp bài nộp chưa được giải nén thành công</strong>
+                      </div>
+                      <p style={{ margin: '0 0 10px', fontSize: 12 }}>
+                        {current.matchReason || 'Tệp bị lỗi cấu trúc nén hoặc có mật khẩu. Theo quy định khảo thí, không chấm 0 điểm mà yêu cầu kiểm tra lại.'}
+                      </p>
+                      <button
+                        onClick={() => retryExtractBatch(current.id)}
+                        className="btn-process-files"
+                        style={{
+                          background: '#e11d48',
+                          borderColor: '#be123c',
+                          padding: '6px 14px',
+                          fontSize: 12,
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: 6,
+                        }}
+                      >
+                        <RotateCcw size={14} /> Thử giải nén lại tệp này
+                      </button>
+                    </div>
+                  )}
 
                   {/* AI Action Header for this student */}
                   <div
